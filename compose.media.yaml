@@ -1,0 +1,12 @@
+# Opt-in: connect this independently managed service to another Compose project.
+services:
+  qbittorrent:
+    networks:
+      shared:
+        aliases:
+          # Do not use "qbittorrent": the old Jellyfin instance may have that DNS name.
+          - qbittorrent-standalone
+networks:
+  shared:
+    external: true
+    name: ${SHARED_NETWORK:?Configure SHARED_NETWORK in .env}

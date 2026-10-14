@@ -1,0 +1,10 @@
+# Opt-in: publish the Web UI ONLY to the address assigned to the host's WG interface.
+# ./stack up --vpn validates that the configured IP really belongs to WG_INTERFACE.
+services:
+  qbittorrent:
+    ports:
+      - name: webui-wireguard
+        host_ip: ${WG_BIND_IP:?WG_BIND_IP must be configured for --vpn}
+        target: ${WEBUI_PORT:?}
+        published: ${WEBUI_PORT:?}
+        protocol: tcp

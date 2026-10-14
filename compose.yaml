@@ -1,0 +1,42 @@
+# qBittorrent standalone service. No public Web UI or inbound P2P port.
+name: ${PROJECT_NAME:?Configure PROJECT_NAME in .env}
+services:
+  qbittorrent:
+    image: ${QBITTORRENT_IMAGE:?Run ./stack lock before composing}
+    environment:
+      PUID: ${PUID:?}
+      PGID: ${PGID:?}
+      TZ: ${TZ:?}
+      UMASK: "007"
+      WEBUI_PORT: ${WEBUI_PORT:?}
+      TORRENTING_PORT: ${TORRENTING_PORT:?}
+    ports:
+      - name: webui-local
+        host_ip: 127.0.0.1
+        target: ${WEBUI_PORT:?}
+        published: ${WEBUI_PORT:?}
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ${CONFIG_ROOT:?}
+        target: /config
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DATA_ROOT:?}
+        target: /data
+        bind:
+          create_host_path: false
+    networks:
+      private: {}
+    restart: unless-stopped
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+networks:
+  private: {}

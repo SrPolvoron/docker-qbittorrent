@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""Small, dependency-free operator CLI for a standalone qBittorrent Compose stack."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import http.cookiejar
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+ROOT = Path(__file__).resolve().parent
+ENV_FILE = ROOT / ".env"
+EXAMPLE_FILE = ROOT / ".env.example"
+IMAGE_LOCK = ROOT / "images.lock.env"
+IMAGE_PREVIOUS = ROOT / "images.lock.env.previous"
+CATEGORIES = ("incomplete", "movies", "tv", "books", "games", "software", "other")
+MANAGED_PATH = Path("torrents") / "standalone"
+KEYS = {
+    "PROJECT_NAME", "PUID", "PGID", "TZ", "WEBUI_PORT", "TORRENTING_PORT",
+    "CONFIG_ROOT", "DATA_ROOT", "SHARED_NETWORK", "WG_INTERFACE",
+    "WG_BIND_IP", "QBITTORRENT_SOURCE_IMAGE",
+}
+REQUIRED = KEYS - {"WG_BIND_IP"}
+RESERVED_PATHS = (Path("/etc"), Path("/dev"), Path("/proc"),
+                  Path("/sys"), Path("/run"), Path("/boot"), Path("/usr"),
+                  Path("/bin"), Path("/sbin"))
+
+
+class SetupError(Exception):
+    """Actionable configuration/runtime error (no traceback needed)."""
+
+
+def parse_env(path: Path = ENV_FILE) -> dict[str, str]:
+    if not path.is_file():
+        raise SetupError(f"Missing {path.name}; run './stack init' first.")
+    if path.is_symlink():
+        raise SetupError(f"Refusing symlink config file: {path}")
+    out: dict[str, str] = {}
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in raw:
+            raise SetupError(f"{path.name}:{lineno}: use literal KEY=VALUE, not shell commands.")
+        key, value = raw.split("=", 1)
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or key not in KEYS:
+            raise SetupError(f"{path.name}:{lineno}: unknown/invalid setting '{key}'.")
+        if key in out:
+            raise SetupError(f"{path.name}:{lineno}: duplicate setting '{key}'.")
+        if value != value.strip() or any(char in value for char in ('"', "'", "$", "`", "\\", "\x00")):
+            raise SetupError(f"{path.name}:{lineno}: use literal values without quotes/expansion.")
+        out[key] = value
+    missing = [key for key in sorted(REQUIRED) if not out.get(key)]
+    if missing:
+        raise SetupError("Missing required settings: " + ", ".join(missing))
+    if set(out) != KEYS:
+        raise SetupError("Missing settings: " + ", ".join(sorted(KEYS - set(out))))
+    return out
+
+
+def path_is_within(path: Path, base: Path) -> bool:
+    return path == base or base in path.parents
+
+
+def validate_path(value: str, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or str(path) != os.path.normpath(value):
+        raise SetupError(f"{label} must be a clean absolute path: {value}")
+    if path == Path("/") or any(path_is_within(path, reserved) for reserved in RESERVED_PATHS):
+        raise SetupError(f"{label} points to a sensitive system directory: {value}")
+    if path_is_within(path, ROOT) or path_is_within(ROOT, path):
+        raise SetupError(f"{label} must be outside this source repository: {value}")
+    assert_no_symlinks(path)
+    return path
+
+
+def assert_no_symlinks(path: Path) -> None:
+    for candidate in reversed((path, *path.parents)):
+        try:
+            mode = candidate.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            raise SetupError(f"Refusing path through a symlink: {candidate}")
+        if not stat.S_ISDIR(mode):
+            raise SetupError(f"Expected a directory, found another file type: {candidate}")
+
+
+def validate(env: dict[str, str], vpn: bool = False) -> None:
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{2,63}", env["PROJECT_NAME"]):
+        raise SetupError("PROJECT_NAME must be lowercase alphanumeric, hyphen or underscore.")
+    for key in ("PUID", "PGID"):
+        try:
+            number = int(env[key])
+        except ValueError as exc:
+            raise SetupError(f"{key} must be a positive integer.") from exc
+        if str(number) != env[key] or not (1 <= number < 2**31):
+            raise SetupError(f"{key} must be a positive non-root UID/GID.")
+    for key in ("WEBUI_PORT", "TORRENTING_PORT"):
+        try:
+            port = int(env[key])
+        except ValueError as exc:
+            raise SetupError(f"{key} must be a valid TCP/UDP port.") from exc
+        if str(port) != env[key] or not (1024 <= port <= 65535):
+            raise SetupError(f"{key} must be between 1024 and 65535.")
+    if env["WEBUI_PORT"] == env["TORRENTING_PORT"]:
+        raise SetupError("Web UI and BitTorrent ports must differ.")
+    try:
+        ZoneInfo(env["TZ"])
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise SetupError(f"Invalid timezone: {env['TZ']}") from exc
+    config = validate_path(env["CONFIG_ROOT"], "CONFIG_ROOT")
+    data = validate_path(env["DATA_ROOT"], "DATA_ROOT")
+    if path_is_within(config, data) or path_is_within(data, config):
+        raise SetupError("CONFIG_ROOT and DATA_ROOT must not contain each other.")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", env["SHARED_NETWORK"]):
+        raise SetupError("Invalid SHARED_NETWORK name.")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", env["WG_INTERFACE"]):
+        raise SetupError("Invalid WG_INTERFACE name.")
+    ref = env["QBITTORRENT_SOURCE_IMAGE"]
+    if not re.fullmatch(r"[A-Za-z0-9._/@:-]+", ref) or "/" not in ref:
+        raise SetupError("Invalid QBITTORRENT_SOURCE_IMAGE reference.")
+    if vpn:
+        if not env["WG_BIND_IP"]:
+            raise SetupError("Set WG_BIND_IP before using --vpn.")
+        try:
+            address = ipaddress.ip_address(env["WG_BIND_IP"])
+        except ValueError as exc:
+            raise SetupError("WG_BIND_IP must be a valid IPv4 address.") from exc
+        if not isinstance(address, ipaddress.IPv4Address) or (address.is_global or address.is_loopback
+                  or address.is_unspecified or address.is_multicast or address.is_link_local):
+            raise SetupError("WG_BIND_IP must be a non-public, non-loopback IPv4 address.")
+
+
+def run(args: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(args, check=check, text=True, capture_output=capture)
+    except FileNotFoundError as exc:
+        raise SetupError(f"Required executable is missing: {args[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = ((exc.stderr or "") + " " + (exc.stdout or "")).strip() if capture else ""
+        raise SetupError(f"Command failed (exit {exc.returncode}): {' '.join(args)} {detail}") from exc
+
+
+def compose_command(env: dict[str, str], *, media: bool = False, vpn: bool = False) -> list[str]:
+    if not IMAGE_LOCK.is_file() or IMAGE_LOCK.is_symlink():
+        raise SetupError("Missing images.lock.env; run './stack lock' first.")
+    return ["docker", "compose", "--env-file", str(ENV_FILE), "--env-file", str(IMAGE_LOCK),
+            "-p", env["PROJECT_NAME"], "-f", str(ROOT / "compose.yaml"),
+            *(["-f", str(ROOT / "compose.media.yaml")] if media else []),
+            *(["-f", str(ROOT / "compose.wireguard.yaml")] if vpn else [])]
+
+
+def resolve_image_repository(ref: str) -> str:
+    ref = ref.split("@", 1)[0]
+    tail = ref.rsplit("/", 1)[-1]
+    if ":" in tail:
+        return ref.rsplit(":", 1)[0]
+    return ref
+
+
+def locked_image(ref: str) -> str:
+    run(["docker", "pull", ref])
+    result = run(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", ref], capture=True)
+    try:
+        digests = json.loads(result.stdout)
+    except ValueError as exc:
+        raise SetupError("Docker did not return valid RepoDigests JSON.") from exc
+    repo = resolve_image_repository(ref)
+    if not isinstance(digests, list):
+        raise SetupError("Docker returned no immutable image digest.")
+    choices = [digest for digest in digests if isinstance(digest, str) and digest.startswith(repo + "@sha256:")]
+    if not choices:
+        raise SetupError("Docker did not return a digest for " + repo)
+    return choices[0]
+
+
+def atomic_write(path: Path, content: str) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=".image-lock-", dir=ROOT)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def lock_image(env: dict[str, str], *, refresh: bool = False) -> None:
+    if IMAGE_LOCK.exists() and not refresh:
+        print(f"Image already locked. To update intentionally: ./stack lock --refresh")
+        return
+    digest = locked_image(env["QBITTORRENT_SOURCE_IMAGE"])
+    if IMAGE_LOCK.exists():
+        if IMAGE_LOCK.is_symlink() or IMAGE_PREVIOUS.is_symlink():
+            raise SetupError("Refusing symlink image lock file.")
+        shutil.copyfile(IMAGE_LOCK, IMAGE_PREVIOUS)
+        IMAGE_PREVIOUS.chmod(0o600)
+    atomic_write(IMAGE_LOCK, f"# Resolved by ./stack lock, never modify manually.\nQBITTORRENT_IMAGE={digest}\n")
+    print(f"Image locked to {digest}")
+
+
+def checked_mkdir(path: Path, uid: int, gid: int, mode: int) -> None:
+    assert_no_symlinks(path)
+    pending = []
+    current = path
+    while not current.exists():
+        pending.append(current)
+        current = current.parent
+    if pending and os.geteuid() != 0 and (os.geteuid() != uid or os.getegid() != gid):
+        raise SetupError("To create directories with specified ownership use 'sudo ./stack prepare'.")
+    for directory in reversed(pending):
+        directory.mkdir(mode=mode)
+        os.chmod(directory, mode)  # only newly created directories
+        if os.geteuid() == 0:
+            os.chown(directory, uid, gid)
+    if not path.is_dir() or path.is_symlink():
+        raise SetupError(f"Invalid directory: {path}")
+
+
+def ensure_ownership(path: Path, uid: int, gid: int) -> None:
+    st = path.stat()
+    if st.st_uid != uid or st.st_gid != gid:
+        raise SetupError(f"Existing directory has unexpected ownership: {path} "
+                         f"({st.st_uid}:{st.st_gid}, expected {uid}:{gid}); review manually.")
+
+
+def prepare(env: dict[str, str]) -> None:
+    uid, gid = int(env["PUID"]), int(env["PGID"])
+    config = Path(env["CONFIG_ROOT"])
+    data = Path(env["DATA_ROOT"])
+    checked_mkdir(config, uid, gid, 0o700)
+    ensure_ownership(config, uid, gid)
+    checked_mkdir(data, uid, gid, 0o770)
+    checked_mkdir(data / MANAGED_PATH, uid, gid, 0o770)
+    ensure_ownership(data / MANAGED_PATH, uid, gid)
+    for category in CATEGORIES:
+        path = data / MANAGED_PATH / category
+        checked_mkdir(path, uid, gid, 0o770)
+        ensure_ownership(path, uid, gid)
+    print("Prepared configuration and isolated category directories (existing content untouched).")
+    print("Set default path /data/torrents/standalone/other and category paths in qBittorrent Web UI.")
+
+
+def verify_vpn_interface(env: dict[str, str]) -> None:
+    interfaces = run(["wg", "show", "interfaces"], capture=True).stdout.split()
+    if env["WG_INTERFACE"] not in interfaces:
+        raise SetupError(f"{env['WG_INTERFACE']} is not a running WireGuard interface.")
+    result = run(["ip", "-j", "address", "show", "dev", env["WG_INTERFACE"]], capture=True)
+    try:
+        addresses = json.loads(result.stdout)
+        found = any(item.get("local") == env["WG_BIND_IP"]
+                    for iface in addresses for item in iface.get("addr_info", [])
+                    if item.get("family") == "inet")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise SetupError("Could not verify WireGuard IPv4 address assignment.") from exc
+    if not found:
+        raise SetupError(f"WG_BIND_IP={env['WG_BIND_IP']} is not assigned to {env['WG_INTERFACE']}.")
+
+
+def network_exists(env: dict[str, str]) -> bool:
+    result = run(["docker", "network", "inspect", env["SHARED_NETWORK"]], capture=True, check=False)
+    return result.returncode == 0
+
+
+def docker_compose(env: dict[str, str], cmd: list[str], *, media: bool = False, vpn: bool = False,
+                   capture: bool = False) -> subprocess.CompletedProcess[str]:
+    return run([*compose_command(env, media=media, vpn=vpn), *cmd], capture=capture)
+
+
+def running_container(env: dict[str, str]) -> bool:
+    result = docker_compose(env, ["ps", "-q", "qbittorrent"], capture=True)
+    ids = result.stdout.strip().splitlines()
+    if not ids:
+        return False
+    inspect = run(["docker", "inspect", "--format", "{{.State.Running}}", ids[0]], capture=True)
+    return inspect.stdout.strip() == "true"
+
+
+def safe_archive_add(archive: tarfile.TarFile, source: Path, arcname: str) -> None:
+    if source.is_symlink():
+        raise SetupError(f"Backup rejects symlinks: {source}")
+    if source.is_dir():
+        archive.add(source, arcname=arcname, recursive=False)
+        for child in sorted(source.iterdir()):
+            safe_archive_add(archive, child, f"{arcname}/{child.name}")
+    elif source.is_file():
+        if not stat.S_ISREG(source.lstat().st_mode):
+            raise SetupError(f"Backup rejects non-regular file: {source}")
+        archive.add(source, arcname=arcname, recursive=False)
+    else:
+        raise SetupError(f"Backup rejects unsupported file type: {source}")
+
+
+def backup(env: dict[str, str], target: Path) -> None:
+    if not target.is_absolute():
+        raise SetupError("--output must be an absolute path.")
+    if target.exists() or target.is_symlink():
+        raise SetupError("Backup destination already exists; will not overwrite it.")
+    if any(path_is_within(target, parent) for parent in (Path(env["CONFIG_ROOT"]), Path(env["DATA_ROOT"]), ROOT)):
+        raise SetupError("Backup must be outside appdata, downloads and source repository.")
+    if not target.parent.is_dir():
+        raise SetupError("Backup parent directory does not exist.")
+    if not Path(env["CONFIG_ROOT"]).is_dir():
+        raise SetupError("Missing config directory; first run './stack prepare'.")
+    was_running = running_container(env)
+    if was_running:
+        docker_compose(env, ["stop", "qbittorrent"])
+    try:
+        # Exclusive creation avoids accidental overwrite; remove incomplete file on failure.
+        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                with tarfile.open(fileobj=output, mode="w:gz") as tar:
+                    safe_archive_add(tar, Path(env["CONFIG_ROOT"]), "config")
+                    safe_archive_add(tar, ENV_FILE, ".env")
+                    safe_archive_add(tar, IMAGE_LOCK, "images.lock.env")
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+    finally:
+        if was_running:
+            docker_compose(env, ["start", "qbittorrent"])
+    print(f"Backup completed: {target} (config/settings only; NO downloads)")
+
+
+
+
+def configure_categories(env: dict[str, str], *, username: str = "admin") -> None:
+    """Set category paths via authenticated loopback API. Never store credentials."""
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", username):
+        raise SetupError("Invalid Web UI username.")
+    base_url = f"http://127.0.0.1:{env['WEBUI_PORT']}"
+    jar = http.cookiejar.CookieJar()
+    client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+    def api(path: str, data: dict[str, str] | None = None):
+        body = None if data is None else urllib.parse.urlencode(data).encode("utf-8")
+        headers = {"Origin": base_url, "Referer": base_url + "/"}
+        req = urllib.request.Request(base_url + "/api/v2/" + path, data=body, headers=headers,
+                                     method="POST" if data is not None else "GET")
+        try:
+            with client.open(req, timeout=10) as result:
+                return result.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raise SetupError(f"qBittorrent Web API HTTP {exc.code} at /api/v2/{path}. "
+                             "Verify credentials and Web UI security settings.") from exc
+        except urllib.error.URLError as exc:
+            raise SetupError("Cannot reach local qBittorrent Web UI. Start stack and open SSH tunnel if remote.") from exc
+
+    password = getpass.getpass(f"qBittorrent Web UI password for {username}: ")
+    if not password:
+        raise SetupError("Password cannot be empty.")
+    # urlencoding body holds the password in this process only, never in commands or files.
+    if api("auth/login", {"username": username, "password": password}).strip() != "Ok.":
+        raise SetupError("qBittorrent Web UI authentication failed.")
+    try:
+        existing = json.loads(api("torrents/categories"))
+    except (ValueError, TypeError) as exc:
+        raise SetupError("Unexpected categories response from qBittorrent API.") from exc
+    if not isinstance(existing, dict):
+        raise SetupError("Unexpected category collection from qBittorrent API.")
+    expected = {category: f"/data/torrents/standalone/{category}" for category in CATEGORIES
+                if category != "incomplete"}
+    # Reject all conflicting categories before performing *any* mutations.
+    for category, dest in expected.items():
+        if category in existing and (not isinstance(existing[category], dict)
+                                      or existing[category].get("savePath", "").rstrip("/") != dest):
+            raise SetupError(f"Category '{category}' already exists with a different path. "
+                             "Review it in the Web UI; no existing category was overwritten.")
+    for category, dest in expected.items():
+        if category not in existing:
+            api("torrents/createCategory", {"category": category, "savePath": dest})
+    preferences = {
+        "save_path": expected["other"],
+        "temp_path_enabled": True,
+        "temp_path": "/data/torrents/standalone/incomplete",
+        "auto_tmm_enabled": True,
+    }
+    api("app/setPreferences", {"json": json.dumps(preferences, separators=(",", ":"))})
+    try:
+        updated = json.loads(api("torrents/categories"))
+        updated_prefs = json.loads(api("app/preferences"))
+    except (ValueError, TypeError) as exc:
+        raise SetupError("Could not confirm category or preference settings after API update.") from exc
+    for category, dest in expected.items():
+        if updated.get(category, {}).get("savePath", "").rstrip("/") != dest:
+            raise SetupError(f"Category '{category}' was not applied correctly.")
+    for key, wanted in preferences.items():
+        if updated_prefs.get(key) != wanted:
+            raise SetupError(f"Preference '{key}' was not applied. Review Web UI settings.")
+    print("Created/verified categories: " + ", ".join(expected))
+    print("Default destination, incomplete path and automatic torrent management verified.")
+    print("No password was saved. Configure appropriate seeding limits in the Web UI.")
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(description="Independent qBittorrent Docker Compose management")
+    cmds = main.add_subparsers(dest="command", required=True)
+    cmds.add_parser("init", help="Create .env from .env.example once")
+    for cmd in ("check", "config", "up"):
+        item = cmds.add_parser(cmd)
+        item.add_argument("--media", action="store_true", help="Connect to optional shared Docker network")
+        item.add_argument("--vpn", action="store_true", help="Add Web UI binding on host WireGuard IP")
+    cmds.add_parser("prepare", help="Prepare appdata and category folders, without altering existing ownership")
+    cmds.add_parser("network-create", help="Create the optional external Docker bridge network")
+    lock = cmds.add_parser("lock", help="Resolve and pin the upstream container image digest")
+    lock.add_argument("--refresh", action="store_true", help="Explicitly update image digest")
+    categories = cmds.add_parser("categories", help="Configure categories and paths through local Web API")
+    categories.add_argument("--username", default="admin", help="Web UI username (password prompted securely)")
+    cmds.add_parser("status")
+    cmds.add_parser("down", help="Stop/remove standalone containers, preserving config and downloads")
+    logs = cmds.add_parser("logs")
+    logs.add_argument("--follow", "-f", action="store_true")
+    logs.add_argument("--tail", type=int, default=100)
+    bkp = cmds.add_parser("backup")
+    bkp.add_argument("--output", required=True, type=Path, help="Absolute destination .tar.gz")
+    return main
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        if args.command == "init":
+            if ENV_FILE.exists() or ENV_FILE.is_symlink():
+                raise SetupError(".env already exists; refusing to overwrite it.")
+            fd = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as dst:
+                dst.write(EXAMPLE_FILE.read_text(encoding="utf-8"))
+            print("Created .env (mode 0600). Edit PUID/PGID and paths before starting.")
+            return 0
+        env = parse_env()
+        vpn = getattr(args, "vpn", False)
+        media = getattr(args, "media", False)
+        validate(env, vpn=vpn)
+        if args.command == "check":
+            print("Configuration is valid.")
+            print(f"Project: {env['PROJECT_NAME']}; SSH-only Web UI: 127.0.0.1:{env['WEBUI_PORT']}")
+            print(f"Config: {env['CONFIG_ROOT']}; Data: {env['DATA_ROOT']}")
+            print(f"Media network: {'enabled' if media else 'off'}; WireGuard Web UI: {'enabled' if vpn else 'off'}")
+        elif args.command == "prepare":
+            prepare(env)
+        elif args.command == "lock":
+            lock_image(env, refresh=args.refresh)
+        elif args.command == "network-create":
+            if network_exists(env):
+                print("Shared Docker network already exists; unchanged.")
+            else:
+                run(["docker", "network", "create", "--driver", "bridge", env["SHARED_NETWORK"]])
+        elif args.command in ("config", "up"):
+            if vpn:
+                verify_vpn_interface(env)
+            if args.command == "up" and media and not network_exists(env):
+                raise SetupError(f"Missing shared network {env['SHARED_NETWORK']}; run './stack network-create'.")
+            docker_compose(env, ["config", "--quiet"])
+            if args.command == "config":
+                docker_compose(env, ["config"], media=media, vpn=vpn)
+            else:
+                docker_compose(env, ["up", "-d"], media=media, vpn=vpn)
+        elif args.command == "categories":
+            if not running_container(env):
+                raise SetupError("The standalone qBittorrent container is not running; start it first.")
+            configure_categories(env, username=args.username)
+        elif args.command == "status":
+            docker_compose(env, ["ps"])
+        elif args.command == "down":
+            docker_compose(env, ["down"])
+        elif args.command == "logs":
+            if args.tail < 1 or args.tail > 10000:
+                raise SetupError("--tail must be between 1 and 10000.")
+            docker_compose(env, ["logs", "--tail", str(args.tail), *(["--follow"] if args.follow else []), "qbittorrent"])
+        elif args.command == "backup":
+            backup(env, args.output)
+        return 0
+    except (SetupError, OSError, tarfile.TarError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

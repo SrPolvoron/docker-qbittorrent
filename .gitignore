@@ -1,0 +1,22 @@
+# Per-host configuration and resolved immutable image reference
+.env
+images.lock.env
+images.lock.env.previous
+# Data, backups, and logs must not be committed
+config/
+data/
+downloads/
+backups/
+*.tar.gz
+*.tar
+*.log
+# Python tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
